@@ -44,9 +44,14 @@ class FakeHistory:
     def load_history(self):
         pass
 
-    def dataset(self):
-        # simple labels placeholder (not used by calibration directly)
-        y = pd.Series((self.df_ohlcv["close"].pct_change().fillna(0) > 0).astype(int))
+    def dataset(self, target: str = "direction"):
+        returns = self.df_ohlcv["close"].pct_change().fillna(0)
+        if target == "direction":
+            y = pd.Series((returns > 0).astype(int))
+        elif target == "return_bps":
+            y = returns * 10_000.0
+        else:
+            raise ValueError(target)
         return self.df_features, y
 
     def update_with_latest(self, limit=3):
@@ -64,6 +69,8 @@ class FakePosition:
         self.open_calls = 0
         self.last_qty = None
         self.closed = 0
+        self.is_long = False
+        self.last_quantity = 0.0
 
     def compute_quantity_kelly(self, p_up, last_price):
         return 1.23
@@ -71,9 +78,13 @@ class FakePosition:
     def open_long(self, qty):
         self.open_calls += 1
         self.last_qty = qty
+        self.last_quantity = qty
+        self.is_long = True
 
     def close_long(self):
         self.closed += 1
+        self.is_long = False
+        self.last_quantity = 0.0
 
 
 class FakeClient:
@@ -105,6 +116,7 @@ def patched_bot(monkeypatch):
         start_str="10 days ago UTC",
         timelag=2,
         retrain_every=9999,  # avoid retrain during test
+        task="classify",
     )
     bot.interval_ms = 1  # tick quickly
     return bot, fake_history, fake_model, fake_position
@@ -137,3 +149,35 @@ def test_trade_decision_uses_threshold(patched_bot, monkeypatch):
         # ensure we would not open a long when below threshold
         # (we just assert the threshold logic; open_long not called)
         assert pos.open_calls == 0
+
+
+def test_classification_trade_maintains_position_when_signal_persists(patched_bot):
+    bot, hist, model, pos = patched_bot
+    bot.bootstrap()
+
+    bot._current_threshold = 0.6
+    bot.position.is_long = True
+    bot.position.last_quantity = 1.23
+    pos.open_calls = 0
+
+    bot._handle_classification_trade(p_up=0.75, last_price=hist.df_ohlcv["close"].iloc[-1])
+
+    # No additional open orders when quantity unchanged
+    assert pos.open_calls == 0
+    assert pos.closed == 0
+    assert bot.position.is_long
+
+
+def test_classification_trade_closes_when_signal_drops(patched_bot):
+    bot, hist, model, pos = patched_bot
+    bot.bootstrap()
+
+    bot._current_threshold = 0.6
+    bot.position.is_long = True
+    bot.position.last_quantity = 1.23
+    pos.closed = 0
+
+    bot._handle_classification_trade(p_up=0.4, last_price=hist.df_ohlcv["close"].iloc[-1])
+
+    assert pos.closed == 1
+    assert not bot.position.is_long

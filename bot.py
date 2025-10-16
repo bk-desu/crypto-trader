@@ -148,16 +148,19 @@ class TradeBot:
         self.calib_window_bars = int(
             getattr(config, "calib_window_bars", calib_window_bars)
         )
-        self.fees_bps = float(
-            getattr(config, "fees_bps", fees_bps if fees_bps is not None else 10.0)
-        )
-        self.slippage_bps = float(
-            getattr(
-                config,
-                "slippage_bps",
-                slippage_bps if slippage_bps is not None else 5.0,
-            )
-        )
+        if fees_bps is not None:
+            self.fees_bps = float(fees_bps)
+        elif hasattr(config, "fees_bps"):
+            self.fees_bps = float(getattr(config, "fees_bps"))
+        else:
+            self.fees_bps = 0.0
+
+        if slippage_bps is not None:
+            self.slippage_bps = float(slippage_bps)
+        elif hasattr(config, "slippage_bps"):
+            self.slippage_bps = float(getattr(config, "slippage_bps"))
+        else:
+            self.slippage_bps = 0.0
         self.pred_ret_scale_bps = float(
             getattr(config, "pred_ret_scale_bps", 20.0)
         )  # for regression → pseudo-prob
@@ -229,6 +232,89 @@ class TradeBot:
 
         # model holder
         self.model: ModelManager | None = None
+
+    # ---------- Trade Execution Helpers ----------
+
+    def _handle_classification_trade(self, p_up: float, last_price: float) -> None:
+        """Execute trading logic for classification models (long-only)."""
+
+        p_down = 1.0 - p_up
+        print(
+            f"Predicted up/down: {p_up:.3f}/{p_down:.3f}  "
+            f"thr={self._current_threshold:.3f}"
+        )
+
+        if p_up >= self._current_threshold:
+            qty = self.position.compute_quantity_kelly(p_up, last_price)
+            print(f"Computed qty (kelly-capped): {qty}")
+            if qty <= 0:
+                print("Quantity rounded to zero; staying flat.")
+                if self.position.is_long:
+                    print("Closing existing long due to zero quantity.")
+                    self.position.close_long()
+                return
+
+            if self.position.is_long:
+                if abs(qty - self.position.last_quantity) > 1e-6:
+                    print(
+                        f"Adjusting position from {self.position.last_quantity} to {qty}."
+                    )
+                    self.position.close_long()
+                    self.position.open_long(qty)
+                else:
+                    print("Signal still valid; maintaining existing long.")
+            else:
+                self.position.open_long(qty)
+        else:
+            if self.position.is_long:
+                print("Probability below threshold; closing long.")
+                self.position.close_long()
+            else:
+                print("Signal below threshold; staying flat.")
+
+    def _handle_regression_trade(
+        self, pred_bps: float, last_price: float, trigger_bps: float
+    ) -> None:
+        """Execute trading logic for regression models (long-only)."""
+
+        print(
+            f"Predicted next-bar return: {pred_bps:.2f} bps | "
+            f"trigger >= {trigger_bps:.1f} bps"
+        )
+
+        if pred_bps >= trigger_bps:
+            p_proxy = _logistic_from_bps(
+                pred_bps, scale_bps=self.pred_ret_scale_bps
+            )
+            qty = self.position.compute_quantity_kelly(p_proxy, last_price)
+            print(
+                f"Computed qty from expected return (kelly via p≈{p_proxy:.3f}): {qty}"
+            )
+
+            if qty <= 0:
+                print("Quantity rounded to zero; staying flat.")
+                if self.position.is_long:
+                    print("Closing existing long due to zero quantity.")
+                    self.position.close_long()
+                return
+
+            if self.position.is_long:
+                if abs(qty - self.position.last_quantity) > 1e-6:
+                    print(
+                        f"Adjusting position from {self.position.last_quantity} to {qty}."
+                    )
+                    self.position.close_long()
+                    self.position.open_long(qty)
+                else:
+                    print("Signal still valid; maintaining existing long.")
+            else:
+                self.position.open_long(qty)
+        else:
+            if self.position.is_long:
+                print("Expected return below threshold; closing long.")
+                self.position.close_long()
+            else:
+                print("Expected return below threshold; staying flat.")
 
     # ---------- Calibration ----------
 
@@ -440,7 +526,6 @@ class TradeBot:
                 while now_ms >= next_trade_time:
                     print(f"\n[BAR CLOSE] {pd.to_datetime(next_trade_time, unit='ms')}")
                     self._update_and_maybe_retrain()
-                    self.position.close_long()
 
                     cost_bps = 2.0 * (self.fees_bps + self.slippage_bps)
 
@@ -452,12 +537,16 @@ class TradeBot:
                                 X_win = _last_window(
                                     self.data.df_features, feat_cols, self.window
                                 )
-                                last_price = float(self.data.df_ohlcv["close"].iloc[-1])
+                                last_price = float(
+                                    self.data.df_ohlcv["close"].iloc[-1]
+                                )
                                 p_up = self.model.predict_proba_up(X_win)
                             except Exception as e:
                                 print(f"[WARN] Prediction skipped: {e}")
                                 p_up = 0.5
-                                last_price = float(self.data.df_ohlcv["close"].iloc[-1])
+                                last_price = float(
+                                    self.data.df_ohlcv["close"].iloc[-1]
+                                )
                         else:
                             X_new = self.data.latest_features_row()
                             last_price = float(X_new["CLOSE"].iloc[0])
@@ -467,17 +556,8 @@ class TradeBot:
                                 print(f"[WARN] Prediction skipped: {e}")
                                 p_up = 0.5
 
-                        p_down = 1.0 - p_up
-                        print(
-                            f"Predicted up/down: {p_up:.3f}/{p_down:.3f}  thr={self._current_threshold:.3f}"
-                        )
-                        if p_up >= self._current_threshold:
-                            qty = self.position.compute_quantity_kelly(p_up, last_price)
-                            print(f"Computed qty (kelly-capped): {qty}")
-                            self.position.open_long(qty)
-                        else:
-                            print("Signal below threshold; staying flat.")
-
+                        print("=====\nModel output (classification)")
+                        self._handle_classification_trade(p_up, last_price)
                     else:  # regress
                         last_price = float(self.data.df_ohlcv["close"].iloc[-1])
                         try:
@@ -500,24 +580,13 @@ class TradeBot:
                             pred_bps = 0.0
 
                         trigger = self._current_ret_threshold_bps + cost_bps
+                        print("=====\nModel output (regression)")
                         print(
-                            f"Predicted next-bar return: {pred_bps:.2f} bps | "
-                            f"trigger >= {self._current_ret_threshold_bps:.1f} + cost {cost_bps:.1f} = {trigger:.1f} bps"
+                            "Threshold breakdown: "
+                            f"base {self._current_ret_threshold_bps:.1f} + "
+                            f"cost {cost_bps:.1f} = {trigger:.1f} bps"
                         )
-                        if pred_bps >= trigger:
-                            # turn predicted bps into a pseudo-prob for Kelly sizing
-                            p_proxy = _logistic_from_bps(
-                                pred_bps, scale_bps=self.pred_ret_scale_bps
-                            )
-                            qty = self.position.compute_quantity_kelly(
-                                p_proxy, last_price
-                            )
-                            print(
-                                f"Computed qty from expected return (kelly via p≈{p_proxy:.3f}): {qty}"
-                            )
-                            self.position.open_long(qty)
-                        else:
-                            print("Expected return below threshold; staying flat.")
+                        self._handle_regression_trade(pred_bps, last_price, trigger)
 
                     next_trade_time += self.interval_ms
 
