@@ -41,18 +41,57 @@ except Exception:  # pragma: no cover
 
 # Deep learning (sequence models) via SciKeras + Keras
 try:
-    from scikeras.wrappers import KerasClassifier  # type: ignore
-    from tensorflow import keras  # type: ignore
-    from tensorflow.keras import layers  # type: ignore
+    from scikeras.wrappers import KerasClassifier, KerasRegressor  # type: ignore
 except Exception:  # pragma: no cover
     KerasClassifier = None  # type: ignore
-    keras = None  # type: ignore
-    layers = None  # type: ignore
+    KerasRegressor = None  # type: ignore
+
+# Prefer the standalone Keras package (used by transformers/tf-keras) but
+# gracefully fall back to tensorflow.keras if it's not available.
+keras = None  # type: ignore
+layers = None  # type: ignore
+try:  # pragma: no cover - executed in most DL-enabled environments
+    import keras as _keras_mod  # type: ignore
+    from keras import layers as _keras_layers  # type: ignore
+
+    keras = _keras_mod  # type: ignore
+    layers = _keras_layers  # type: ignore
+    try:  # ensure TF backend when using Keras 3
+        if hasattr(keras, "config"):
+            backend = keras.config.backend()  # type: ignore[attr-defined]
+            if backend != "tensorflow":  # pragma: no branch
+                keras.config.set_backend("tensorflow")  # type: ignore[attr-defined]
+    except Exception:  # pragma: no cover - fallback silently if API differs
+        pass
+except Exception:  # pragma: no cover
+    try:
+        from tensorflow import keras as _keras_mod  # type: ignore
+        from tensorflow.keras import layers as _keras_layers  # type: ignore
+
+        keras = _keras_mod  # type: ignore
+        layers = _keras_layers  # type: ignore
+    except Exception:  # pragma: no cover
+        keras = None  # type: ignore
+        layers = None  # type: ignore
 
 try:
     from statsmodels.tsa.arima.model import ARIMA  # type: ignore
 except Exception:  # pragma: no cover
     ARIMA = None  # type: ignore
+try:
+    from statsmodels.tsa.statespace.sarimax import SARIMAX  # type: ignore
+except Exception:  # pragma: no cover
+    SARIMAX = None  # type: ignore
+try:
+    from statsmodels.tsa.api import VAR  # type: ignore
+except Exception:  # pragma: no cover
+    VAR = None  # type: ignore
+try:
+    from statsmodels.tsa.regime_switching.markov_regression import (  # type: ignore
+        MarkovRegression,
+    )
+except Exception:  # pragma: no cover
+    MarkovRegression = None  # type: ignore
 
 # ---- model/type names (keep your existing classifier names) ----
 ClassifierName = Literal[
@@ -70,7 +109,20 @@ ClassifierName = Literal[
     "arima",
 ]
 # Simple, practical regressors to start
-RegressorName = Literal["hgb_reg", "rf_reg", "linreg", "svr", "arima"]
+RegressorName = Literal[
+    "hgb_reg",
+    "rf_reg",
+    "linreg",
+    "svr",
+    "arima",
+    "bilstm",
+    "gru_lstm",
+    "hybrid_transformer",
+    "sarimax",
+    "var",
+    "garch",
+    "markov_switching",
+]
 
 ModelName = Union[ClassifierName, RegressorName]
 Task = Literal["classify", "regress"]
@@ -150,6 +202,21 @@ class SequenceMaker(TransformerMixin, BaseEstimator):
         )
 
 
+def _as_2d_array(X: Union[pd.DataFrame, np.ndarray, None]) -> Optional[np.ndarray]:
+    if X is None:
+        return None
+    if isinstance(X, pd.DataFrame):
+        arr = X.to_numpy(dtype=float, copy=False)
+        return np.asarray(arr, dtype=float)
+    arr = np.asarray(X, dtype=float)
+    if arr.ndim == 1:
+        return arr.reshape(-1, 1)
+    if arr.ndim == 3:
+        n, t, d = arr.shape
+        return arr.reshape(n, t * d)
+    return arr
+
+
 class MetaLabelingClassifier(BaseEstimator, ClassifierMixin):
     def __init__(
         self, base: BaseEstimator, meta: BaseEstimator, threshold: float = 0.5
@@ -190,7 +257,7 @@ class MetaLabelingClassifier(BaseEstimator, ClassifierMixin):
 
 
 def _ensure_keras():
-    if KerasClassifier is None or keras is None or layers is None:
+    if keras is None or layers is None:
         raise ImportError(
             "Sequence models require TensorFlow + SciKeras. Install:\n  pip install tensorflow scikeras"
         )
@@ -239,6 +306,52 @@ def _hybrid_transformer_builder(meta):
     out = layers.Dense(1, activation="sigmoid")(x)
     model = keras.Model(inp, out)
     model.compile(optimizer="adam", loss="binary_crossentropy", metrics=["AUC"])
+    return model
+
+
+def _bilstm_reg_builder(meta):
+    _ensure_keras()
+    t, d = meta["X_shape_"][1], meta["X_shape_"][2]
+    inp = keras.Input(shape=(t, d))
+    x = layers.Bidirectional(layers.LSTM(64))(inp)
+    x = layers.Dense(64, activation="relu")(x)
+    x = layers.Dropout(0.2)(x)
+    out = layers.Dense(1, activation="linear")(x)
+    model = keras.Model(inp, out)
+    model.compile(optimizer="adam", loss="mse", metrics=["mae"])
+    return model
+
+
+def _gru_lstm_reg_builder(meta):
+    _ensure_keras()
+    t, d = meta["X_shape_"][1], meta["X_shape_"][2]
+    inp = keras.Input(shape=(t, d))
+    x = layers.GRU(64, return_sequences=True)(inp)
+    x = layers.LSTM(32)(x)
+    x = layers.Dense(64, activation="relu")(x)
+    x = layers.Dropout(0.2)(x)
+    out = layers.Dense(1, activation="linear")(x)
+    model = keras.Model(inp, out)
+    model.compile(optimizer="adam", loss="mse", metrics=["mae"])
+    return model
+
+
+def _hybrid_transformer_reg_builder(meta):
+    _ensure_keras()
+    t, d = meta["X_shape_"][1], meta["X_shape_"][2]
+    inp = keras.Input(shape=(t, d))
+    x = layers.LayerNormalization()(inp)
+    attn = layers.MultiHeadAttention(num_heads=4, key_dim=max(8, d // 2))(x, x)
+    x = layers.Add()([x, attn])
+    x = layers.LayerNormalization()(x)
+    ffn = keras.Sequential([layers.Dense(128, activation="relu"), layers.Dense(d)])
+    x = layers.Add()([x, ffn(x)])
+    x = layers.GlobalAveragePooling1D()(x)
+    x = layers.Dense(64, activation="relu")(x)
+    x = layers.Dropout(0.2)(x)
+    out = layers.Dense(1, activation="linear")(x)
+    model = keras.Model(inp, out)
+    model.compile(optimizer="adam", loss="mse", metrics=["mae"])
     return model
 
 
@@ -312,6 +425,208 @@ class ARIMARegressor(BaseEstimator, RegressorMixin):
         # One-step-ahead style: forecast n_steps into the future
         fc = self.results_.forecast(steps=int(n_steps))
         return np.asarray(fc, dtype=float).ravel()
+
+
+class SARIMAXRegressor(BaseEstimator, RegressorMixin):
+    def __init__(
+        self,
+        order: Tuple[int, int, int] = (1, 1, 1),
+        seasonal_order: Tuple[int, int, int, int] = (0, 0, 0, 0),
+        trend: str | None = "c",
+        enforce_stationarity: bool = False,
+        enforce_invertibility: bool = False,
+    ):
+        self.order = order
+        self.seasonal_order = seasonal_order
+        self.trend = trend
+        self.enforce_stationarity = enforce_stationarity
+        self.enforce_invertibility = enforce_invertibility
+        self.model_ = None
+        self.results_ = None
+        self._exog_dim: Optional[int] = None
+
+    def fit(self, X, y):
+        if SARIMAX is None:
+            raise ImportError(
+                "Install statsmodels to use SARIMAXRegressor: pip install statsmodels"
+            )
+        y_arr = np.asarray(y, dtype=float).ravel()
+        exog = _as_2d_array(X)
+        if exog is not None and len(exog) != len(y_arr):
+            raise ValueError("X and y must have the same number of rows for SARIMAX.")
+        self.model_ = SARIMAX(
+            y_arr,
+            exog=exog,
+            order=self.order,
+            seasonal_order=self.seasonal_order,
+            trend=self.trend,
+            enforce_stationarity=self.enforce_stationarity,
+            enforce_invertibility=self.enforce_invertibility,
+        )
+        self.results_ = self.model_.fit(disp=False)
+        self._exog_dim = None if exog is None else exog.shape[1]
+        return self
+
+    def predict(self, X):
+        if self.results_ is None:
+            raise RuntimeError("SARIMAX model is not fitted.")
+        exog = _as_2d_array(X)
+        if self._exog_dim is None:
+            exog = None
+        elif exog is None:
+            raise ValueError("Exogenous features were used in training and are required for prediction.")
+        elif exog.shape[1] != self._exog_dim:
+            raise ValueError(
+                f"Expected {self._exog_dim} exogenous features at predict time, got {exog.shape[1]}"
+            )
+        steps = len(X) if hasattr(X, "__len__") else int(np.asarray(X).shape[0])
+        forecast = self.results_.get_forecast(steps=steps, exog=exog)
+        return np.asarray(forecast.predicted_mean, dtype=float)
+
+
+class VARRegressor(BaseEstimator, RegressorMixin):
+    def __init__(
+        self,
+        maxlags: Optional[int] = None,
+        ic: Optional[str] = None,
+        trend: str = "c",
+    ):
+        self.maxlags = maxlags
+        self.ic = ic
+        self.trend = trend
+        self.model_ = None
+        self.results_ = None
+        self._endog_history: Optional[np.ndarray] = None
+        self._k_ar: int = 1
+
+    def fit(self, X, y):
+        if VAR is None:
+            raise ImportError("Install statsmodels to use VARRegressor: pip install statsmodels")
+        y_arr = np.asarray(y, dtype=float).ravel()
+        exog = _as_2d_array(X)
+        if exog is None:
+            endog = y_arr.reshape(-1, 1)
+        else:
+            if len(exog) != len(y_arr):
+                raise ValueError("X and y must have the same number of rows for VAR.")
+            endog = np.column_stack([y_arr.reshape(-1, 1), exog])
+        self.model_ = VAR(endog)
+        self.results_ = self.model_.fit(maxlags=self.maxlags, ic=self.ic, trend=self.trend)
+        self._k_ar = int(self.results_.k_ar)
+        if self._k_ar <= 0:
+            self._k_ar = 1
+        self._endog_history = endog[-self._k_ar :]
+        return self
+
+    def predict(self, X):
+        if self.results_ is None or self._endog_history is None:
+            raise RuntimeError("VAR model is not fitted.")
+        steps = len(X) if hasattr(X, "__len__") else int(np.asarray(X).shape[0])
+        forecasts = self.results_.forecast(self._endog_history, steps=steps)
+        return np.asarray(forecasts[:, 0], dtype=float)
+
+
+class GARCHRegressor(BaseEstimator, RegressorMixin):
+    def __init__(
+        self,
+        p: int = 1,
+        q: int = 1,
+        mean: str = "AR",
+        lags: int | List[int] | None = 1,
+        vol: str = "GARCH",
+    ):
+        self.p = p
+        self.q = q
+        self.mean = mean
+        self.lags = lags
+        self.vol = vol
+        self.model_ = None
+        self.results_ = None
+
+    def fit(self, X, y):
+        try:
+            from arch import arch_model  # type: ignore
+        except Exception as exc:  # pragma: no cover
+            raise ImportError("Install 'arch' to use GARCHRegressor: pip install arch") from exc
+
+        y_arr = np.asarray(y, dtype=float).ravel()
+        if y_arr.size < max(10, (self.p + self.q + 1)):
+            raise ValueError("Not enough observations to fit GARCH model.")
+        self.model_ = arch_model(
+            y_arr,
+            mean=self.mean,
+            lags=self.lags,
+            vol=self.vol,
+            p=self.p,
+            q=self.q,
+            rescale=False,
+        )
+        self.results_ = self.model_.fit(disp="off", update_freq=0)
+        return self
+
+    def predict(self, X):
+        if self.results_ is None:
+            raise RuntimeError("GARCH model is not fitted.")
+        steps = len(X) if hasattr(X, "__len__") else int(np.asarray(X).shape[0])
+        fc = self.results_.forecast(horizon=steps, reindex=False)
+        mean_df = fc.mean
+        preds = mean_df.iloc[-1].to_numpy(dtype=float)
+        return np.asarray(preds, dtype=float)
+
+
+class MarkovSwitchingRegressor(BaseEstimator, RegressorMixin):
+    def __init__(
+        self,
+        k_regimes: int = 2,
+        trend: str = "c",
+        switching_variance: bool = True,
+        switching_trend: bool = False,
+        markov_order: int = 1,
+        maxiter: int = 200,
+        tol: float = 1e-6,
+    ):
+        self.k_regimes = k_regimes
+        self.trend = trend
+        self.switching_variance = switching_variance
+        self.switching_trend = switching_trend
+        self.markov_order = markov_order
+        self.maxiter = maxiter
+        self.tol = tol
+        self.model_ = None
+        self.results_ = None
+
+    def fit(self, X, y):
+        if MarkovRegression is None:
+            raise ImportError(
+                "Install statsmodels to use MarkovSwitchingRegressor: pip install statsmodels"
+            )
+        y_arr = np.asarray(y, dtype=float).ravel()
+        self.model_ = MarkovRegression(
+            y_arr,
+            k_regimes=self.k_regimes,
+            trend=self.trend,
+            switching_variance=self.switching_variance,
+            switching_trend=self.switching_trend,
+            order=self.markov_order,
+        )
+        self.results_ = self.model_.fit(disp=False, maxiter=self.maxiter, tol=self.tol)
+        try:
+            self._last_pred_mean = float(self.results_.predict()[-1])
+        except Exception:
+            self._last_pred_mean = float(np.mean(y_arr))
+        return self
+
+    def predict(self, X):
+        if self.results_ is None:
+            raise RuntimeError("Markov-switching model is not fitted.")
+        steps = len(X) if hasattr(X, "__len__") else int(np.asarray(X).shape[0])
+        if steps <= 0:
+            return np.empty(0, dtype=float)
+        try:
+            fc = self.results_.forecast(steps=steps)
+            return np.asarray(fc, dtype=float)
+        except NotImplementedError:
+            return np.full(steps, self._last_pred_mean, dtype=float)
 
 
 class ModelManager:
@@ -412,6 +727,10 @@ class ModelManager:
             return CalibratedClassifierCV(svc, cv=3)
         if name == "bilstm":
             _ensure_keras()
+            if KerasClassifier is None:
+                raise ImportError(
+                    "Sequence classifiers require SciKeras. Install: pip install scikeras"
+                )
             return KerasClassifier(
                 model=_bilstm_builder,
                 epochs=self.nn_epochs,
@@ -420,6 +739,10 @@ class ModelManager:
             )
         if name == "gru_lstm":
             _ensure_keras()
+            if KerasClassifier is None:
+                raise ImportError(
+                    "Sequence classifiers require SciKeras. Install: pip install scikeras"
+                )
             return KerasClassifier(
                 model=_gru_lstm_builder,
                 epochs=self.nn_epochs,
@@ -428,6 +751,10 @@ class ModelManager:
             )
         if name == "hybrid_transformer":
             _ensure_keras()
+            if KerasClassifier is None:
+                raise ImportError(
+                    "Sequence classifiers require SciKeras. Install: pip install scikeras"
+                )
             return KerasClassifier(
                 model=_hybrid_transformer_builder,
                 epochs=self.nn_epochs,
@@ -506,6 +833,50 @@ class ModelManager:
             return Ridge(alpha=1.0, random_state=self.random_state)
         if name == "svr":
             return SVR(kernel="rbf")  # scaled upstream
+        if name == "bilstm":
+            _ensure_keras()
+            if KerasRegressor is None:
+                raise ImportError(
+                    "Sequence regressors require SciKeras. Install: pip install scikeras"
+                )
+            return KerasRegressor(
+                model=_bilstm_reg_builder,
+                epochs=self.nn_epochs,
+                batch_size=self.nn_batch_size,
+                verbose=0,
+            )
+        if name == "gru_lstm":
+            _ensure_keras()
+            if KerasRegressor is None:
+                raise ImportError(
+                    "Sequence regressors require SciKeras. Install: pip install scikeras"
+                )
+            return KerasRegressor(
+                model=_gru_lstm_reg_builder,
+                epochs=self.nn_epochs,
+                batch_size=self.nn_batch_size,
+                verbose=0,
+            )
+        if name == "hybrid_transformer":
+            _ensure_keras()
+            if KerasRegressor is None:
+                raise ImportError(
+                    "Sequence regressors require SciKeras. Install: pip install scikeras"
+                )
+            return KerasRegressor(
+                model=_hybrid_transformer_reg_builder,
+                epochs=self.nn_epochs,
+                batch_size=self.nn_batch_size,
+                verbose=0,
+            )
+        if name == "sarimax":
+            return SARIMAXRegressor()
+        if name == "var":
+            return VARRegressor()
+        if name == "garch":
+            return GARCHRegressor()
+        if name == "markov_switching":
+            return MarkovSwitchingRegressor()
         if name == "arima":
             return ARIMARegressor()
         raise ValueError(f"Unknown regressor name: {name}")
@@ -529,10 +900,9 @@ class ModelManager:
                 self.numeric_cols = list(self.numeric_cols) + [self.garch_out_col]
 
         if self.input_kind == "sequence":
-            # (Optional future: sequence regressors)
-            raise NotImplementedError(
-                "Sequence regression not implemented. Use tabular regressors."
-            )
+            steps.append(("to_seq", SequenceMaker(self.sequence_maker)))
+            steps.append(("reg", self._simple_estimator_reg(self.model_name)))  # type: ignore[arg-type]
+            return Pipeline(steps)
 
         prep = (
             ColumnTransformer(
