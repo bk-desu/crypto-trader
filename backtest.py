@@ -225,6 +225,10 @@ def evaluate_combo(
             "bilstm": "bilstm",
             "gru_lstm": "gru_lstm",
             "hybrid_transformer": "hybrid_transformer",
+            "sarimax": "sarimax",
+            "var": "var",
+            "garch": "garch",
+            "markov_switching": "markov_switching",
         }
         reg_model_name = reg_name_map.get(model_name, "hgb_reg")
 

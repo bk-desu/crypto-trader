@@ -78,6 +78,20 @@ try:
     from statsmodels.tsa.arima.model import ARIMA  # type: ignore
 except Exception:  # pragma: no cover
     ARIMA = None  # type: ignore
+try:
+    from statsmodels.tsa.statespace.sarimax import SARIMAX  # type: ignore
+except Exception:  # pragma: no cover
+    SARIMAX = None  # type: ignore
+try:
+    from statsmodels.tsa.api import VAR  # type: ignore
+except Exception:  # pragma: no cover
+    VAR = None  # type: ignore
+try:
+    from statsmodels.tsa.regime_switching.markov_regression import (  # type: ignore
+        MarkovRegression,
+    )
+except Exception:  # pragma: no cover
+    MarkovRegression = None  # type: ignore
 
 # ---- model/type names (keep your existing classifier names) ----
 ClassifierName = Literal[
@@ -104,6 +118,10 @@ RegressorName = Literal[
     "bilstm",
     "gru_lstm",
     "hybrid_transformer",
+    "sarimax",
+    "var",
+    "garch",
+    "markov_switching",
 ]
 
 ModelName = Union[ClassifierName, RegressorName]
@@ -182,6 +200,21 @@ class SequenceMaker(TransformerMixin, BaseEstimator):
         raise RuntimeError(
             "For sequence models, provide X as a 3D numpy array or pass sequence_maker=callable."
         )
+
+
+def _as_2d_array(X: Union[pd.DataFrame, np.ndarray, None]) -> Optional[np.ndarray]:
+    if X is None:
+        return None
+    if isinstance(X, pd.DataFrame):
+        arr = X.to_numpy(dtype=float, copy=False)
+        return np.asarray(arr, dtype=float)
+    arr = np.asarray(X, dtype=float)
+    if arr.ndim == 1:
+        return arr.reshape(-1, 1)
+    if arr.ndim == 3:
+        n, t, d = arr.shape
+        return arr.reshape(n, t * d)
+    return arr
 
 
 class MetaLabelingClassifier(BaseEstimator, ClassifierMixin):
@@ -392,6 +425,208 @@ class ARIMARegressor(BaseEstimator, RegressorMixin):
         # One-step-ahead style: forecast n_steps into the future
         fc = self.results_.forecast(steps=int(n_steps))
         return np.asarray(fc, dtype=float).ravel()
+
+
+class SARIMAXRegressor(BaseEstimator, RegressorMixin):
+    def __init__(
+        self,
+        order: Tuple[int, int, int] = (1, 1, 1),
+        seasonal_order: Tuple[int, int, int, int] = (0, 0, 0, 0),
+        trend: str | None = "c",
+        enforce_stationarity: bool = False,
+        enforce_invertibility: bool = False,
+    ):
+        self.order = order
+        self.seasonal_order = seasonal_order
+        self.trend = trend
+        self.enforce_stationarity = enforce_stationarity
+        self.enforce_invertibility = enforce_invertibility
+        self.model_ = None
+        self.results_ = None
+        self._exog_dim: Optional[int] = None
+
+    def fit(self, X, y):
+        if SARIMAX is None:
+            raise ImportError(
+                "Install statsmodels to use SARIMAXRegressor: pip install statsmodels"
+            )
+        y_arr = np.asarray(y, dtype=float).ravel()
+        exog = _as_2d_array(X)
+        if exog is not None and len(exog) != len(y_arr):
+            raise ValueError("X and y must have the same number of rows for SARIMAX.")
+        self.model_ = SARIMAX(
+            y_arr,
+            exog=exog,
+            order=self.order,
+            seasonal_order=self.seasonal_order,
+            trend=self.trend,
+            enforce_stationarity=self.enforce_stationarity,
+            enforce_invertibility=self.enforce_invertibility,
+        )
+        self.results_ = self.model_.fit(disp=False)
+        self._exog_dim = None if exog is None else exog.shape[1]
+        return self
+
+    def predict(self, X):
+        if self.results_ is None:
+            raise RuntimeError("SARIMAX model is not fitted.")
+        exog = _as_2d_array(X)
+        if self._exog_dim is None:
+            exog = None
+        elif exog is None:
+            raise ValueError("Exogenous features were used in training and are required for prediction.")
+        elif exog.shape[1] != self._exog_dim:
+            raise ValueError(
+                f"Expected {self._exog_dim} exogenous features at predict time, got {exog.shape[1]}"
+            )
+        steps = len(X) if hasattr(X, "__len__") else int(np.asarray(X).shape[0])
+        forecast = self.results_.get_forecast(steps=steps, exog=exog)
+        return np.asarray(forecast.predicted_mean, dtype=float)
+
+
+class VARRegressor(BaseEstimator, RegressorMixin):
+    def __init__(
+        self,
+        maxlags: Optional[int] = None,
+        ic: Optional[str] = None,
+        trend: str = "c",
+    ):
+        self.maxlags = maxlags
+        self.ic = ic
+        self.trend = trend
+        self.model_ = None
+        self.results_ = None
+        self._endog_history: Optional[np.ndarray] = None
+        self._k_ar: int = 1
+
+    def fit(self, X, y):
+        if VAR is None:
+            raise ImportError("Install statsmodels to use VARRegressor: pip install statsmodels")
+        y_arr = np.asarray(y, dtype=float).ravel()
+        exog = _as_2d_array(X)
+        if exog is None:
+            endog = y_arr.reshape(-1, 1)
+        else:
+            if len(exog) != len(y_arr):
+                raise ValueError("X and y must have the same number of rows for VAR.")
+            endog = np.column_stack([y_arr.reshape(-1, 1), exog])
+        self.model_ = VAR(endog)
+        self.results_ = self.model_.fit(maxlags=self.maxlags, ic=self.ic, trend=self.trend)
+        self._k_ar = int(self.results_.k_ar)
+        if self._k_ar <= 0:
+            self._k_ar = 1
+        self._endog_history = endog[-self._k_ar :]
+        return self
+
+    def predict(self, X):
+        if self.results_ is None or self._endog_history is None:
+            raise RuntimeError("VAR model is not fitted.")
+        steps = len(X) if hasattr(X, "__len__") else int(np.asarray(X).shape[0])
+        forecasts = self.results_.forecast(self._endog_history, steps=steps)
+        return np.asarray(forecasts[:, 0], dtype=float)
+
+
+class GARCHRegressor(BaseEstimator, RegressorMixin):
+    def __init__(
+        self,
+        p: int = 1,
+        q: int = 1,
+        mean: str = "AR",
+        lags: int | List[int] | None = 1,
+        vol: str = "GARCH",
+    ):
+        self.p = p
+        self.q = q
+        self.mean = mean
+        self.lags = lags
+        self.vol = vol
+        self.model_ = None
+        self.results_ = None
+
+    def fit(self, X, y):
+        try:
+            from arch import arch_model  # type: ignore
+        except Exception as exc:  # pragma: no cover
+            raise ImportError("Install 'arch' to use GARCHRegressor: pip install arch") from exc
+
+        y_arr = np.asarray(y, dtype=float).ravel()
+        if y_arr.size < max(10, (self.p + self.q + 1)):
+            raise ValueError("Not enough observations to fit GARCH model.")
+        self.model_ = arch_model(
+            y_arr,
+            mean=self.mean,
+            lags=self.lags,
+            vol=self.vol,
+            p=self.p,
+            q=self.q,
+            rescale=False,
+        )
+        self.results_ = self.model_.fit(disp="off", update_freq=0)
+        return self
+
+    def predict(self, X):
+        if self.results_ is None:
+            raise RuntimeError("GARCH model is not fitted.")
+        steps = len(X) if hasattr(X, "__len__") else int(np.asarray(X).shape[0])
+        fc = self.results_.forecast(horizon=steps, reindex=False)
+        mean_df = fc.mean
+        preds = mean_df.iloc[-1].to_numpy(dtype=float)
+        return np.asarray(preds, dtype=float)
+
+
+class MarkovSwitchingRegressor(BaseEstimator, RegressorMixin):
+    def __init__(
+        self,
+        k_regimes: int = 2,
+        trend: str = "c",
+        switching_variance: bool = True,
+        switching_trend: bool = False,
+        markov_order: int = 1,
+        maxiter: int = 200,
+        tol: float = 1e-6,
+    ):
+        self.k_regimes = k_regimes
+        self.trend = trend
+        self.switching_variance = switching_variance
+        self.switching_trend = switching_trend
+        self.markov_order = markov_order
+        self.maxiter = maxiter
+        self.tol = tol
+        self.model_ = None
+        self.results_ = None
+
+    def fit(self, X, y):
+        if MarkovRegression is None:
+            raise ImportError(
+                "Install statsmodels to use MarkovSwitchingRegressor: pip install statsmodels"
+            )
+        y_arr = np.asarray(y, dtype=float).ravel()
+        self.model_ = MarkovRegression(
+            y_arr,
+            k_regimes=self.k_regimes,
+            trend=self.trend,
+            switching_variance=self.switching_variance,
+            switching_trend=self.switching_trend,
+            order=self.markov_order,
+        )
+        self.results_ = self.model_.fit(disp=False, maxiter=self.maxiter, tol=self.tol)
+        try:
+            self._last_pred_mean = float(self.results_.predict()[-1])
+        except Exception:
+            self._last_pred_mean = float(np.mean(y_arr))
+        return self
+
+    def predict(self, X):
+        if self.results_ is None:
+            raise RuntimeError("Markov-switching model is not fitted.")
+        steps = len(X) if hasattr(X, "__len__") else int(np.asarray(X).shape[0])
+        if steps <= 0:
+            return np.empty(0, dtype=float)
+        try:
+            fc = self.results_.forecast(steps=steps)
+            return np.asarray(fc, dtype=float)
+        except NotImplementedError:
+            return np.full(steps, self._last_pred_mean, dtype=float)
 
 
 class ModelManager:
@@ -634,6 +869,14 @@ class ModelManager:
                 batch_size=self.nn_batch_size,
                 verbose=0,
             )
+        if name == "sarimax":
+            return SARIMAXRegressor()
+        if name == "var":
+            return VARRegressor()
+        if name == "garch":
+            return GARCHRegressor()
+        if name == "markov_switching":
+            return MarkovSwitchingRegressor()
         if name == "arima":
             return ARIMARegressor()
         raise ValueError(f"Unknown regressor name: {name}")

@@ -50,7 +50,10 @@ def test_evaluate_combo_smoke(monkeypatch):
         def load_history(self):
             pass
 
-        def dataset(self):
+        def dataset(self, target="direction"):
+            if target == "return_bps":
+                ret = self.df_ohlcv["close"].pct_change().fillna(0) * 10_000.0
+                return self.df_features, ret
             y = pd.Series(
                 (self.df_ohlcv["close"].pct_change().fillna(0) > 0).astype(int)
             )
@@ -66,12 +69,23 @@ def test_evaluate_combo_smoke(monkeypatch):
         def fit(self, X, y):
             pass
 
+    class FakeRegPipeline:
+        def fit(self, X, y):
+            pass
+
+        def predict(self, X):
+            return np.full(len(X), 0.001)
+
     class FakeModel:
         def __init__(self, **kw):
             self.pipeline = FakePipeline()
+            self.reg_pipeline = FakeRegPipeline()
 
         def _build_pipeline(self):
             return self.pipeline
+
+        def _build_pipeline_reg(self):
+            return self.reg_pipeline
 
         def train(self, X, y):
             return 0.66
