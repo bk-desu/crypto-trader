@@ -222,25 +222,62 @@ def evaluate_combo(
             "linreg": "linreg",
             "svr": "svr",
             "arima": "arima",
+            "bilstm": "bilstm",
+            "gru_lstm": "gru_lstm",
+            "hybrid_transformer": "hybrid_transformer",
         }
         reg_model_name = reg_name_map.get(model_name, "hgb_reg")
+
+        seq_models = {"bilstm", "gru_lstm", "hybrid_transformer"}
+        use_sequence = reg_model_name in seq_models
+
+        if use_sequence:
+            window = max(2, timelag)
+            stride = 1
+            feat_cols = list(X.columns)
+            X_seq = make_windows_from_df(
+                data.df_features, feat_cols, window=window, stride=stride
+            )
+            if len(X_seq) == 0:
+                raise RuntimeError(
+                    f"Not enough rows ({len(X)}) to form any {window}-length windows."
+                )
+            idx_last = (window - 1) + np.arange(len(X_seq)) * stride
+            y_aligned = y_ret.to_numpy(dtype=float, copy=False)[idx_last]
+            y_aligned_series = pd.Series(y_aligned)
+            X_nd = X_seq
+        else:
+            y_aligned = y_ret.to_numpy(dtype=float, copy=False)
+            y_aligned_series = pd.Series(y_aligned)
+            X_nd = X.reset_index(drop=True)
 
         model = ModelManager(
             predictor_cols=list(X.columns),
             model_name=reg_model_name,
-            input_kind="tabular",
+            input_kind="sequence" if use_sequence else "tabular",
             task="regress",
         )
 
         # time split and fit ONLY on train
-        n = len(X)
+        n = len(X_nd)
         idx_train, idx_test = time_split_indices(n, test_size)
-        X_train, y_train = X.iloc[idx_train], y_ret.iloc[idx_train]
-        X_test, y_test = X.iloc[idx_test], y_ret.iloc[idx_test]
+        if use_sequence:
+            X_train = X_nd[idx_train]  # type: ignore[index]
+            X_test = X_nd[idx_test]  # type: ignore[index]
+            y_train_series = y_aligned_series.iloc[idx_train]
+            y_test_series = y_aligned_series.iloc[idx_test]
+        else:
+            X_train = X_nd.iloc[idx_train]  # type: ignore[assignment]
+            X_test = X_nd.iloc[idx_test]  # type: ignore[assignment]
+            y_train_series = y_aligned_series.iloc[idx_train]
+            y_test_series = y_aligned_series.iloc[idx_test]
+
+        y_train = y_train_series.to_numpy(dtype=float, copy=False)
+        y_test = y_test_series.to_numpy(dtype=float, copy=False)
 
         model.pipeline = model._build_pipeline_reg()
         model.pipeline.fit(X_train, y_train)
-        yhat_test = model.pipeline.predict(X_test)
+        yhat_test = np.asarray(model.pipeline.predict(X_test), dtype=float)
 
         from sklearn.metrics import r2_score
 
@@ -289,10 +326,8 @@ def evaluate_combo(
             pred_df = pd.DataFrame(
                 {"p_up": np.nan, "y_true": np.nan, "fwd_ret": np.nan}
             )
-            pred_df.loc[: len(yhat_test) - 1, "fwd_ret"] = y_test.values
-            pred_df.loc[: len(yhat_test) - 1, "p_up"] = (
-                yhat_test  # store predicted return in 'p_up' slot for convenience
-            )
+            pred_df.loc[: len(yhat_test) - 1, "fwd_ret"] = y_test
+            pred_df.loc[: len(yhat_test) - 1, "p_up"] = yhat_test
             pred_df.to_csv(
                 os.path.join(
                     out_dir,

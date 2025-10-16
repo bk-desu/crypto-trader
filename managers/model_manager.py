@@ -41,13 +41,38 @@ except Exception:  # pragma: no cover
 
 # Deep learning (sequence models) via SciKeras + Keras
 try:
-    from scikeras.wrappers import KerasClassifier  # type: ignore
-    from tensorflow import keras  # type: ignore
-    from tensorflow.keras import layers  # type: ignore
+    from scikeras.wrappers import KerasClassifier, KerasRegressor  # type: ignore
 except Exception:  # pragma: no cover
     KerasClassifier = None  # type: ignore
-    keras = None  # type: ignore
-    layers = None  # type: ignore
+    KerasRegressor = None  # type: ignore
+
+# Prefer the standalone Keras package (used by transformers/tf-keras) but
+# gracefully fall back to tensorflow.keras if it's not available.
+keras = None  # type: ignore
+layers = None  # type: ignore
+try:  # pragma: no cover - executed in most DL-enabled environments
+    import keras as _keras_mod  # type: ignore
+    from keras import layers as _keras_layers  # type: ignore
+
+    keras = _keras_mod  # type: ignore
+    layers = _keras_layers  # type: ignore
+    try:  # ensure TF backend when using Keras 3
+        if hasattr(keras, "config"):
+            backend = keras.config.backend()  # type: ignore[attr-defined]
+            if backend != "tensorflow":  # pragma: no branch
+                keras.config.set_backend("tensorflow")  # type: ignore[attr-defined]
+    except Exception:  # pragma: no cover - fallback silently if API differs
+        pass
+except Exception:  # pragma: no cover
+    try:
+        from tensorflow import keras as _keras_mod  # type: ignore
+        from tensorflow.keras import layers as _keras_layers  # type: ignore
+
+        keras = _keras_mod  # type: ignore
+        layers = _keras_layers  # type: ignore
+    except Exception:  # pragma: no cover
+        keras = None  # type: ignore
+        layers = None  # type: ignore
 
 try:
     from statsmodels.tsa.arima.model import ARIMA  # type: ignore
@@ -70,7 +95,16 @@ ClassifierName = Literal[
     "arima",
 ]
 # Simple, practical regressors to start
-RegressorName = Literal["hgb_reg", "rf_reg", "linreg", "svr", "arima"]
+RegressorName = Literal[
+    "hgb_reg",
+    "rf_reg",
+    "linreg",
+    "svr",
+    "arima",
+    "bilstm",
+    "gru_lstm",
+    "hybrid_transformer",
+]
 
 ModelName = Union[ClassifierName, RegressorName]
 Task = Literal["classify", "regress"]
@@ -190,7 +224,7 @@ class MetaLabelingClassifier(BaseEstimator, ClassifierMixin):
 
 
 def _ensure_keras():
-    if KerasClassifier is None or keras is None or layers is None:
+    if keras is None or layers is None:
         raise ImportError(
             "Sequence models require TensorFlow + SciKeras. Install:\n  pip install tensorflow scikeras"
         )
@@ -239,6 +273,52 @@ def _hybrid_transformer_builder(meta):
     out = layers.Dense(1, activation="sigmoid")(x)
     model = keras.Model(inp, out)
     model.compile(optimizer="adam", loss="binary_crossentropy", metrics=["AUC"])
+    return model
+
+
+def _bilstm_reg_builder(meta):
+    _ensure_keras()
+    t, d = meta["X_shape_"][1], meta["X_shape_"][2]
+    inp = keras.Input(shape=(t, d))
+    x = layers.Bidirectional(layers.LSTM(64))(inp)
+    x = layers.Dense(64, activation="relu")(x)
+    x = layers.Dropout(0.2)(x)
+    out = layers.Dense(1, activation="linear")(x)
+    model = keras.Model(inp, out)
+    model.compile(optimizer="adam", loss="mse", metrics=["mae"])
+    return model
+
+
+def _gru_lstm_reg_builder(meta):
+    _ensure_keras()
+    t, d = meta["X_shape_"][1], meta["X_shape_"][2]
+    inp = keras.Input(shape=(t, d))
+    x = layers.GRU(64, return_sequences=True)(inp)
+    x = layers.LSTM(32)(x)
+    x = layers.Dense(64, activation="relu")(x)
+    x = layers.Dropout(0.2)(x)
+    out = layers.Dense(1, activation="linear")(x)
+    model = keras.Model(inp, out)
+    model.compile(optimizer="adam", loss="mse", metrics=["mae"])
+    return model
+
+
+def _hybrid_transformer_reg_builder(meta):
+    _ensure_keras()
+    t, d = meta["X_shape_"][1], meta["X_shape_"][2]
+    inp = keras.Input(shape=(t, d))
+    x = layers.LayerNormalization()(inp)
+    attn = layers.MultiHeadAttention(num_heads=4, key_dim=max(8, d // 2))(x, x)
+    x = layers.Add()([x, attn])
+    x = layers.LayerNormalization()(x)
+    ffn = keras.Sequential([layers.Dense(128, activation="relu"), layers.Dense(d)])
+    x = layers.Add()([x, ffn(x)])
+    x = layers.GlobalAveragePooling1D()(x)
+    x = layers.Dense(64, activation="relu")(x)
+    x = layers.Dropout(0.2)(x)
+    out = layers.Dense(1, activation="linear")(x)
+    model = keras.Model(inp, out)
+    model.compile(optimizer="adam", loss="mse", metrics=["mae"])
     return model
 
 
@@ -412,6 +492,10 @@ class ModelManager:
             return CalibratedClassifierCV(svc, cv=3)
         if name == "bilstm":
             _ensure_keras()
+            if KerasClassifier is None:
+                raise ImportError(
+                    "Sequence classifiers require SciKeras. Install: pip install scikeras"
+                )
             return KerasClassifier(
                 model=_bilstm_builder,
                 epochs=self.nn_epochs,
@@ -420,6 +504,10 @@ class ModelManager:
             )
         if name == "gru_lstm":
             _ensure_keras()
+            if KerasClassifier is None:
+                raise ImportError(
+                    "Sequence classifiers require SciKeras. Install: pip install scikeras"
+                )
             return KerasClassifier(
                 model=_gru_lstm_builder,
                 epochs=self.nn_epochs,
@@ -428,6 +516,10 @@ class ModelManager:
             )
         if name == "hybrid_transformer":
             _ensure_keras()
+            if KerasClassifier is None:
+                raise ImportError(
+                    "Sequence classifiers require SciKeras. Install: pip install scikeras"
+                )
             return KerasClassifier(
                 model=_hybrid_transformer_builder,
                 epochs=self.nn_epochs,
@@ -506,6 +598,42 @@ class ModelManager:
             return Ridge(alpha=1.0, random_state=self.random_state)
         if name == "svr":
             return SVR(kernel="rbf")  # scaled upstream
+        if name == "bilstm":
+            _ensure_keras()
+            if KerasRegressor is None:
+                raise ImportError(
+                    "Sequence regressors require SciKeras. Install: pip install scikeras"
+                )
+            return KerasRegressor(
+                model=_bilstm_reg_builder,
+                epochs=self.nn_epochs,
+                batch_size=self.nn_batch_size,
+                verbose=0,
+            )
+        if name == "gru_lstm":
+            _ensure_keras()
+            if KerasRegressor is None:
+                raise ImportError(
+                    "Sequence regressors require SciKeras. Install: pip install scikeras"
+                )
+            return KerasRegressor(
+                model=_gru_lstm_reg_builder,
+                epochs=self.nn_epochs,
+                batch_size=self.nn_batch_size,
+                verbose=0,
+            )
+        if name == "hybrid_transformer":
+            _ensure_keras()
+            if KerasRegressor is None:
+                raise ImportError(
+                    "Sequence regressors require SciKeras. Install: pip install scikeras"
+                )
+            return KerasRegressor(
+                model=_hybrid_transformer_reg_builder,
+                epochs=self.nn_epochs,
+                batch_size=self.nn_batch_size,
+                verbose=0,
+            )
         if name == "arima":
             return ARIMARegressor()
         raise ValueError(f"Unknown regressor name: {name}")
@@ -529,10 +657,9 @@ class ModelManager:
                 self.numeric_cols = list(self.numeric_cols) + [self.garch_out_col]
 
         if self.input_kind == "sequence":
-            # (Optional future: sequence regressors)
-            raise NotImplementedError(
-                "Sequence regression not implemented. Use tabular regressors."
-            )
+            steps.append(("to_seq", SequenceMaker(self.sequence_maker)))
+            steps.append(("reg", self._simple_estimator_reg(self.model_name)))  # type: ignore[arg-type]
+            return Pipeline(steps)
 
         prep = (
             ColumnTransformer(

@@ -205,16 +205,17 @@ class TradeBot:
                 "rf_reg": "rf_reg",
                 "linreg": "linreg",
                 "svr": "svr",
+                "bilstm": "bilstm",
+                "gru_lstm": "gru_lstm",
+                "hybrid_transformer": "hybrid_transformer",
             }
             self.model_name = reg_name_map.get(raw_model_name, "hgb_reg")
         else:
             self.model_name = raw_model_name
 
-        # Only allow sequence models for classification
+        # Sequence models available for both tasks
         self.seq_models = {"bilstm", "gru_lstm", "hybrid_transformer"}
-        self.use_sequence = (self.task == "classify") and (
-            self.model_name in self.seq_models
-        )
+        self.use_sequence = self.model_name in self.seq_models
 
         self.window = max(2, timelag)
         self.position = PositionManager(
@@ -293,11 +294,23 @@ class TradeBot:
             if len(X_ret) == 0:
                 return
 
-            yhat_bps_all = self.model.pipeline.predict(X_ret)  # type: ignore
+            if self.use_sequence:
+                feat_cols = list(X_ret.columns)
+                X_seq = _make_rolling_windows(
+                    self.data.df_features, feat_cols, self.window
+                )
+                if len(X_seq) == 0:
+                    return
+                yhat_bps_all = self.model.pipeline.predict(X_seq)  # type: ignore
+                y_seq = np.asarray(y_ret_bps)[self.window - 1 :]
+                y_seq = y_seq[-len(X_seq) :]
+            else:
+                yhat_bps_all = self.model.pipeline.predict(X_ret)  # type: ignore
+                y_seq = np.asarray(y_ret_bps)
 
             # use last calib_window_bars
             yhat_win = np.asarray(yhat_bps_all)[-self.calib_window_bars :]
-            ytrue_win = np.asarray(y_ret_bps)[-self.calib_window_bars :]
+            ytrue_win = np.asarray(y_seq)[-self.calib_window_bars :]
 
             best = _sweep_on_predicted_return(
                 yhat_bps=yhat_win,
@@ -348,13 +361,24 @@ class TradeBot:
             self.model = ModelManager(
                 predictor_cols=self.data.predictor_cols,
                 model_name=self.model_name,
-                input_kind="tabular",
+                input_kind="sequence" if self.use_sequence else "tabular",
                 task="regress",
             )
             print(
                 f"Dataset ready: {len(X)} rows, {len(self.data.predictor_cols)} features (task=regress)"
             )
-            r2 = self.model.train_regression(X, y_bps)
+            if self.use_sequence:
+                feat_cols = list(X.columns)
+                X_seq = _make_rolling_windows(
+                    self.data.df_features, feat_cols, self.window
+                )
+                if len(X_seq) == 0:
+                    raise RuntimeError(f"Not enough data for window={self.window}")
+                y_seq = np.asarray(y_bps)[self.window - 1 :]
+                y_seq = y_seq[-len(X_seq) :]
+                r2 = self.model.train_regression(X_seq, y_seq)
+            else:
+                r2 = self.model.train_regression(X, y_bps)
             print(f"Initial test R^2: {r2:.3f}")
 
         self._calibrate_threshold()
@@ -383,7 +407,20 @@ class TradeBot:
                     print(f"Retrained (clf). Test accuracy: {acc:.3f}")
                 else:
                     X, y_bps = self.data.dataset(target="return_bps")
-                    r2 = self.model.train_regression(X, y_bps)
+                    if self.use_sequence:
+                        feat_cols = list(X.columns)
+                        X_seq = _make_rolling_windows(
+                            self.data.df_features, feat_cols, self.window
+                        )
+                        if len(X_seq) == 0:
+                            raise RuntimeError(
+                                f"Not enough data for window={self.window}"
+                            )
+                        y_seq = np.asarray(y_bps)[self.window - 1 :]
+                        y_seq = y_seq[-len(X_seq) :]
+                        r2 = self.model.train_regression(X_seq, y_seq)
+                    else:
+                        r2 = self.model.train_regression(X, y_bps)
                     print(f"Retrained (reg). Test R^2: {r2:.3f}")
 
                 self._calibrate_threshold()
@@ -442,10 +479,22 @@ class TradeBot:
                             print("Signal below threshold; staying flat.")
 
                     else:  # regress
-                        X_new = self.data.latest_features_row()
-                        last_price = float(X_new["CLOSE"].iloc[0])
+                        last_price = float(self.data.df_ohlcv["close"].iloc[-1])
                         try:
-                            pred_bps = float(self.model.pipeline.predict(X_new)[0])  # type: ignore
+                            if self.use_sequence:
+                                X_ret, _ = self.data.dataset(target="return_bps")
+                                feat_cols = list(X_ret.columns)
+                                X_win = _last_window(
+                                    self.data.df_features, feat_cols, self.window
+                                )
+                                pred_bps = float(
+                                    self.model.pipeline.predict(X_win)[0]
+                                )  # type: ignore
+                            else:
+                                X_new = self.data.latest_features_row()
+                                pred_bps = float(
+                                    self.model.pipeline.predict(X_new)[0]
+                                )  # type: ignore
                         except Exception as e:
                             print(f"[WARN] Prediction skipped: {e}")
                             pred_bps = 0.0
