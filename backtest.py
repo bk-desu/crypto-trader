@@ -2,7 +2,7 @@ import argparse
 import os
 import time
 import warnings
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Literal
 
 import numpy as np
 import pandas as pd
@@ -166,6 +166,113 @@ def sweep_on_predicted_return(
     return best
 
 
+def _build_price_frame(
+    data,
+    indices: np.ndarray,
+    split_label: Literal["train", "test"],
+    y_true_bps: np.ndarray,
+    y_pred_bps: np.ndarray,
+    *,
+    symbol: str,
+    model: str,
+    task: str,
+    interval_code: str,
+    start_str: str,
+    predicted_prob: Optional[np.ndarray] = None,
+) -> pd.DataFrame:
+    """Compose a tidy frame with actual/predicted prices for plotting."""
+
+    if len(indices) == 0:
+        return pd.DataFrame()
+
+    idx_arr = np.asarray(indices)
+    closes = (
+        data.df_ohlcv["close"].reindex(idx_arr).to_numpy(dtype=float, copy=False)
+    )
+    feature_time_ms = (
+        data.df_ohlcv["open_time"].reindex(idx_arr).to_numpy(dtype=float, copy=False)
+    )
+    target_time_ms = (
+        data.df_ohlcv["open_time"].shift(-1).reindex(idx_arr).to_numpy(
+            dtype=float, copy=False
+        )
+    )
+    actual_next_close = (
+        data.df_ohlcv["close"].shift(-1).reindex(idx_arr).to_numpy(
+            dtype=float, copy=False
+        )
+    )
+
+    y_true = np.asarray(y_true_bps, dtype=float)
+    y_pred = np.asarray(y_pred_bps, dtype=float)
+
+    mask = ~(
+        np.isnan(closes)
+        | np.isnan(feature_time_ms)
+        | np.isnan(target_time_ms)
+        | np.isnan(actual_next_close)
+        | np.isnan(y_true)
+        | np.isnan(y_pred)
+    )
+
+    if predicted_prob is not None:
+        prob_arr = np.asarray(predicted_prob, dtype=float)
+        mask &= ~np.isnan(prob_arr)
+    else:
+        prob_arr = None
+
+    if not mask.any():
+        return pd.DataFrame()
+
+    idx_arr = idx_arr[mask]
+    closes = closes[mask]
+    feature_time_ms = feature_time_ms[mask].astype(np.int64, copy=False)
+    target_time_ms = target_time_ms[mask].astype(np.int64, copy=False)
+    actual_next_close = actual_next_close[mask]
+    y_true = y_true[mask]
+    y_pred = y_pred[mask]
+    if prob_arr is not None:
+        prob_arr = prob_arr[mask]
+
+    predicted_next_close = closes * (1.0 + (y_pred / 10_000.0))
+
+    df = pd.DataFrame(
+        {
+            "symbol": symbol,
+            "model": model,
+            "task": task,
+            "interval": interval_code,
+            "start_str": start_str,
+            "split": split_label,
+            "sample_index": idx_arr.astype(int, copy=False),
+            "feature_time_ms": feature_time_ms,
+            "target_time_ms": target_time_ms,
+            "current_close": closes,
+            "actual_next_close": actual_next_close,
+            "predicted_next_close": predicted_next_close,
+            "actual_return_bps": y_true,
+            "predicted_return_bps": y_pred,
+        }
+    )
+
+    df["feature_time_iso"] = (
+        pd.to_datetime(df["feature_time_ms"], unit="ms", utc=True)
+        .dt.tz_convert("UTC")
+        .dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    )
+    df["target_time_iso"] = (
+        pd.to_datetime(df["target_time_ms"], unit="ms", utc=True)
+        .dt.tz_convert("UTC")
+        .dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    )
+    if prob_arr is not None:
+        df["predicted_prob_up"] = prob_arr
+    else:
+        df["predicted_prob_up"] = np.nan
+
+    return df
+
+
 def evaluate_combo(
     symbol: str,
     start_str: str,
@@ -206,6 +313,7 @@ def evaluate_combo(
     if task == "regress":
         # Predict next-bar return in bps
         X, y_ret = data.dataset(target="return_bps")
+        original_index = X.index.to_numpy()
 
         # map common classifier names to sensible regressors if provided
         reg_name_map = {
@@ -248,11 +356,13 @@ def evaluate_combo(
                 )
             idx_last = (window - 1) + np.arange(len(X_seq)) * stride
             y_aligned = y_ret.to_numpy(dtype=float, copy=False)[idx_last]
-            y_aligned_series = pd.Series(y_aligned)
+            aligned_index = original_index[idx_last]
+            y_aligned_series = pd.Series(y_aligned, index=aligned_index)
             X_nd = X_seq
         else:
             y_aligned = y_ret.to_numpy(dtype=float, copy=False)
-            y_aligned_series = pd.Series(y_aligned)
+            aligned_index = original_index
+            y_aligned_series = pd.Series(y_aligned, index=aligned_index)
             X_nd = X.reset_index(drop=True)
 
         model = ModelManager(
@@ -281,6 +391,7 @@ def evaluate_combo(
 
         model.pipeline = model._build_pipeline_reg()
         model.pipeline.fit(X_train, y_train)
+        yhat_train = np.asarray(model.pipeline.predict(X_train), dtype=float)
         yhat_test = np.asarray(model.pipeline.predict(X_test), dtype=float)
 
         from sklearn.metrics import r2_score
@@ -307,6 +418,51 @@ def evaluate_combo(
         # artifacts
         ts_tag = time.strftime("%Y%m%d_%H%M%S")
         tag = f"{symbol}_{interval_code}_{reg_model_name}_{ts_tag}"
+
+        aligned_index_arr = y_aligned_series.index.to_numpy()
+        train_indices = aligned_index_arr[idx_train]
+        test_indices = aligned_index_arr[idx_test]
+
+        price_frames = [
+            _build_price_frame(
+                data,
+                train_indices,
+                "train",
+                y_train,
+                yhat_train,
+                symbol=symbol,
+                model=reg_model_name,
+                task="regress",
+                interval_code=interval_code,
+                start_str=start_str,
+            ),
+            _build_price_frame(
+                data,
+                test_indices,
+                "test",
+                y_test,
+                yhat_test,
+                symbol=symbol,
+                model=reg_model_name,
+                task="regress",
+                interval_code=interval_code,
+                start_str=start_str,
+            ),
+        ]
+
+        price_frames = [df for df in price_frames if not df.empty]
+        price_rel_path = ""
+        if price_frames:
+            price_df = (
+                pd.concat(price_frames, ignore_index=True)
+                .sort_values("target_time_ms")
+                .reset_index(drop=True)
+            )
+            os.makedirs(os.path.join(out_dir, "predictions"), exist_ok=True)
+            price_rel_path = os.path.join(
+                "predictions", f"PRICE_{start_str.replace(' ', '_')}_{tag}.csv"
+            )
+            price_df.to_csv(os.path.join(out_dir, price_rel_path), index=False)
         if save_datasets:
             os.makedirs(os.path.join(out_dir, "datasets"), exist_ok=True)
             data.df_ohlcv.to_csv(
@@ -373,10 +529,12 @@ def evaluate_combo(
             "mae_bps": float(mean_absolute_error(y_test, yhat_test)),
             "rmse_bps": float(rmse_bps),
             "mape_pct": float(mape_pct),
+            "price_track_path": price_rel_path,
         }
 
     # ================= CLASSIFICATION PATH (original) =================
     X, y_dir = data.dataset(target="direction")
+    original_index_cls = X.index.to_numpy()
 
     # forward returns aligned with features (for money metrics)
     fwd_ret = (
@@ -414,13 +572,19 @@ def evaluate_combo(
         idx_last = (window - 1) + np.arange(n_seq) * stride
         y = np.asarray(y)[idx_last]
         fwd_ret = fwd_ret[idx_last]
+        aligned_index_cls = original_index_cls[idx_last]
         X_nd = X_seq
     else:
+        aligned_index_cls = original_index_cls
         X_nd = X
 
     n = len(X_nd)
     if n < 200:
         print(f"[WARN] Only {n} rows; results may be noisy.")
+
+    aligned_index_arr = np.asarray(aligned_index_cls)
+    fwd_ret_arr = np.asarray(fwd_ret, dtype=float)
+    y_arr = np.asarray(y)
 
     model = ModelManager(
         predictor_cols=list(X.columns),
@@ -431,6 +595,8 @@ def evaluate_combo(
         sequence_maker=None,
         task="classify",
     )
+
+    price_frames: List[pd.DataFrame] = []
 
     if split_mode == "random":
         test_acc = model.train(X_nd, pd.Series(y))
@@ -449,21 +615,49 @@ def evaluate_combo(
         cm = confusion_matrix(y, y_pred_all).tolist()
 
         test_mask = np.ones(n, dtype=bool)
-        p_up_test, y_test, fwd_test = p_up_all, y, fwd_ret
+        p_up_test, y_test, fwd_test = p_up_all, y, fwd_ret_arr
+
+        pos_mask = y_arr == 1
+        neg_mask = y_arr == 0
+        pos_mean = np.nanmean(fwd_ret_arr[pos_mask]) if pos_mask.any() else np.nan
+        neg_mean = np.nanmean(fwd_ret_arr[neg_mask]) if neg_mask.any() else np.nan
+        if np.isnan(pos_mean):
+            pos_mean = np.nanmean(fwd_ret_arr)
+        if np.isnan(neg_mean):
+            neg_mean = np.nanmean(fwd_ret_arr)
+        if np.isnan(pos_mean):
+            pos_mean = 0.0
+        if np.isnan(neg_mean):
+            neg_mean = 0.0
+        expected_ret_all = p_up_all * pos_mean + (1.0 - p_up_all) * neg_mean
+        price_frames.append(
+            _build_price_frame(
+                data,
+                aligned_index_arr,
+                "test",
+                fwd_ret_arr * 10_000.0,
+                expected_ret_all * 10_000.0,
+                symbol=symbol,
+                model=model_name,
+                task="classify",
+                interval_code=interval_code,
+                start_str=start_str,
+                predicted_prob=p_up_all,
+            )
+        )
 
     else:  # time split
         idx_train, idx_test = time_split_indices(n, test_size)
-        X_test, y_test = (
-            (X_nd[idx_test] if use_sequence else X.iloc[idx_test]),
-            y[idx_test],
-        )
+        X_train_split = X_nd[idx_train] if use_sequence else X.iloc[idx_train]
+        X_test_split = X_nd[idx_test] if use_sequence else X.iloc[idx_test]
+        y_train_split = y[idx_train]
+        y_test = y[idx_test]
 
         model.pipeline = model._build_pipeline_clf()
-        model.pipeline.fit(
-            X_nd[idx_train] if use_sequence else X.iloc[idx_train], y[idx_train]
-        )
+        model.pipeline.fit(X_train_split, y_train_split)
 
-        p_up_test = model.pipeline.predict_proba(X_test)[:, 1]
+        p_up_train = model.pipeline.predict_proba(X_train_split)[:, 1]
+        p_up_test = model.pipeline.predict_proba(X_test_split)[:, 1]
         y_pred = (p_up_test >= 0.5).astype(int)
 
         acc = accuracy_score(y_test, y_pred)
@@ -478,7 +672,54 @@ def evaluate_combo(
 
         test_mask = np.zeros(n, dtype=bool)
         test_mask[idx_test] = True
-        fwd_test = fwd_ret[idx_test]
+        fwd_train = fwd_ret_arr[idx_train]
+        fwd_test = fwd_ret_arr[idx_test]
+
+        pos_mask = y_arr[idx_train] == 1
+        neg_mask = y_arr[idx_train] == 0
+        pos_mean = np.nanmean(fwd_train[pos_mask]) if pos_mask.any() else np.nan
+        neg_mean = np.nanmean(fwd_train[neg_mask]) if neg_mask.any() else np.nan
+        if np.isnan(pos_mean):
+            pos_mean = np.nanmean(fwd_train)
+        if np.isnan(neg_mean):
+            neg_mean = np.nanmean(fwd_train)
+        if np.isnan(pos_mean):
+            pos_mean = 0.0
+        if np.isnan(neg_mean):
+            neg_mean = 0.0
+
+        expected_ret_train = p_up_train * pos_mean + (1.0 - p_up_train) * neg_mean
+        expected_ret_test = p_up_test * pos_mean + (1.0 - p_up_test) * neg_mean
+        price_frames.extend(
+            [
+                _build_price_frame(
+                    data,
+                    aligned_index_arr[idx_train],
+                    "train",
+                    fwd_train * 10_000.0,
+                    expected_ret_train * 10_000.0,
+                    symbol=symbol,
+                    model=model_name,
+                    task="classify",
+                    interval_code=interval_code,
+                    start_str=start_str,
+                    predicted_prob=p_up_train,
+                ),
+                _build_price_frame(
+                    data,
+                    aligned_index_arr[idx_test],
+                    "test",
+                    fwd_test * 10_000.0,
+                    expected_ret_test * 10_000.0,
+                    symbol=symbol,
+                    model=model_name,
+                    task="classify",
+                    interval_code=interval_code,
+                    start_str=start_str,
+                    predicted_prob=p_up_test,
+                ),
+            ]
+        )
 
     # threshold sweep (probability) w/ costs
     best = choose_best_threshold_for_window(
@@ -523,6 +764,20 @@ def evaluate_combo(
     # artifacts
     ts_tag = time.strftime("%Y%m%d_%H%M%S")
     tag = f"{symbol}_{interval_code}_{model_name}_{ts_tag}"
+
+    price_frames = [df for df in price_frames if not df.empty]
+    price_rel_path = ""
+    if price_frames:
+        price_df = (
+            pd.concat(price_frames, ignore_index=True)
+            .sort_values("target_time_ms")
+            .reset_index(drop=True)
+        )
+        os.makedirs(os.path.join(out_dir, "predictions"), exist_ok=True)
+        price_rel_path = os.path.join(
+            "predictions", f"PRICE_{start_str.replace(' ', '_')}_{tag}.csv"
+        )
+        price_df.to_csv(os.path.join(out_dir, price_rel_path), index=False)
 
     if save_datasets:
         os.makedirs(os.path.join(out_dir, "datasets"), exist_ok=True)
@@ -598,6 +853,7 @@ def evaluate_combo(
         "mae_bps": float("nan"),
         "mape_pct": float("nan"),
         "log_loss": float(logloss),
+        "price_track_path": price_rel_path,
     }
 
 
