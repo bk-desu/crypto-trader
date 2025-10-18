@@ -15,6 +15,7 @@ from binance.client import Client
 
 from features.fear_index import get_fng_features
 from features.fomc import get_fomc_sentiment
+from features.market_indices import get_nasdaq_features, get_sp500_features
 from features.on_chain_data import get_btc_onchain_smoothed
 
 INTERVAL_TO_MS = {
@@ -105,6 +106,10 @@ class HistoryManager:
         onchain_kwargs: Optional[Dict[str, Any]] = None,
         include_fomc: bool = True,
         fomc_kwargs: Optional[Dict[str, Any]] = None,
+        include_sp500: bool = True,
+        sp500_kwargs: Optional[Dict[str, Any]] = None,
+        include_nasdaq: bool = True,
+        nasdaq_kwargs: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.client = client
         self.symbol = symbol
@@ -123,6 +128,10 @@ class HistoryManager:
         self.onchain_kwargs = onchain_kwargs or {}
         self.include_fomc = include_fomc
         self.fomc_kwargs = fomc_kwargs or {}
+        self.include_sp500 = include_sp500
+        self.sp500_kwargs = sp500_kwargs or {}
+        self.include_nasdaq = include_nasdaq
+        self.nasdaq_kwargs = nasdaq_kwargs or {}
 
         # data holders
         self.df_ohlcv: pd.DataFrame = pd.DataFrame()
@@ -354,6 +363,44 @@ class HistoryManager:
                         oc_aligned.index = feat.index
                         feat = feat.join(oc_aligned, how="left")
                         appended_cols.extend(list(oc_aligned.columns))
+            except Exception:
+                pass
+
+        # S&P 500 index
+        if self.include_sp500:
+            try:
+                sp_df = get_sp500_features(
+                    start=start_iso,
+                    end=end_iso,
+                    interval=code_iv,
+                    **self.sp500_kwargs,
+                )
+                if not sp_df.empty:
+                    sp_num = sp_df.select_dtypes(include=[np.number])
+                    if not sp_num.empty:
+                        sp_aligned = sp_num.reindex(ts_utc, method="ffill")
+                        sp_aligned.index = feat.index
+                        feat = feat.join(sp_aligned, how="left")
+                        appended_cols.extend(list(sp_aligned.columns))
+            except Exception:
+                pass
+
+        # NASDAQ Composite index
+        if self.include_nasdaq:
+            try:
+                nd_df = get_nasdaq_features(
+                    start=start_iso,
+                    end=end_iso,
+                    interval=code_iv,
+                    **self.nasdaq_kwargs,
+                )
+                if not nd_df.empty:
+                    nd_num = nd_df.select_dtypes(include=[np.number])
+                    if not nd_num.empty:
+                        nd_aligned = nd_num.reindex(ts_utc, method="ffill")
+                        nd_aligned.index = feat.index
+                        feat = feat.join(nd_aligned, how="left")
+                        appended_cols.extend(list(nd_aligned.columns))
             except Exception:
                 pass
 

@@ -1,5 +1,7 @@
 import numpy as np
 import pandas as pd
+import tempfile
+from pathlib import Path
 
 import backtest as tm
 
@@ -31,7 +33,8 @@ def test_evaluate_combo_smoke(monkeypatch):
     # Synthetic data
     closes = np.array([100, 101, 102, 103, 104, 103.5, 104.5, 104.7], dtype=float)
     idx = pd.RangeIndex(len(closes))
-    df_ohlcv = pd.DataFrame({"close": closes}, index=idx)
+    open_times = (idx * 60_000).astype(int)
+    df_ohlcv = pd.DataFrame({"open_time": open_times, "close": closes}, index=idx)
     df_features = pd.DataFrame(
         {
             "CLOSE": closes,
@@ -96,27 +99,40 @@ def test_evaluate_combo_smoke(monkeypatch):
     # map_interval returns anything non-None from dict—just bypass
     monkeypatch.setattr(tm, "map_interval", lambda code: code)
 
-    res = tm.evaluate_combo(
-        symbol="BTCUSDT",
-        start_str="60d",
-        interval_code="1h",
-        timelag=10,
-        model_name="logreg",
-        class_weight=None,
-        split_mode="time",
-        test_size=0.25,
-        out_dir=".",
-        save_datasets=False,
-        save_predictions=False,
-        sweep_cfg=tm.SweepConfig(0.5, 0.9, 0.1),
-        fees_bps=10.0,
-        slippage_bps=5.0,
-        label_mode="direction",
-        ret_bps=0.0,
-        client=FakeClient(),
-        best_metric="sharpe_like",
-        task="regress",
-    )
+    with tempfile.TemporaryDirectory() as tmpdir:
+        res = tm.evaluate_combo(
+            symbol="BTCUSDT",
+            start_str="60d",
+            interval_code="1h",
+            timelag=10,
+            model_name="logreg",
+            class_weight=None,
+            split_mode="time",
+            test_size=0.25,
+            out_dir=tmpdir,
+            save_datasets=False,
+            save_predictions=False,
+            sweep_cfg=tm.SweepConfig(0.5, 0.9, 0.1),
+            fees_bps=10.0,
+            slippage_bps=5.0,
+            label_mode="direction",
+            ret_bps=0.0,
+            client=FakeClient(),
+            best_metric="sharpe_like",
+            task="regress",
+        )
+
+        price_dir = Path(tmpdir) / "predictions"
+        price_files = list(price_dir.glob("PRICE_*.csv"))
+        assert price_files, "expected price tracking output"
+        price_df = pd.read_csv(price_files[0])
+        assert {
+            "split",
+            "actual_next_close",
+            "predicted_next_close",
+            "actual_return_bps",
+            "predicted_return_bps",
+        }.issubset(price_df.columns)
 
     # sanity checks
     for k in [
